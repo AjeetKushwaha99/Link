@@ -1,104 +1,91 @@
-# bot.py - FINAL WORKING VERSION (No Cookies Needed!)
+# bot.py - ULTIMATE WORKING VERSION 2025
 
 import os
-import re
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = "8526618009:AAHoS3k_iH5IsQh76JAKeMkzZcFyh7RYsCs"
 
-# Auto convert any wrapper to real TeraBox link
-def convert_to_real_link(url):
-    patterns = [
-        r'(?:terasharefile\.com|1024terabox\.com|4funbox\.co|nephobox\.com)/s/([a-zA-Z0-9_-]+)',
-        r'terabox\.app/s/([a-zA-Z0-9_-]+)',
-        r'terabox\.com/s/([a-zA-Z0-9_-]+)'
-    ]
+# BEST WORKING API 2025
+def get_direct_link(url):
+    api_url = "https://terabox-dl.qtcloud.workers.dev/api/get-info"
     
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            code = match.group(1)
-            real_link = f"https://www.terabox.com/s/{code}"
-            return real_link, code
-    return None, None
-
-# Get direct download link (works on converted links)
-def get_direct_link(terabox_url):
     try:
-        # Best working API (Jan 2025)
-        api = "https://terabox-dl.qtcloud.workers.dev/api/get-info"
-        response = requests.get(api, params={"url": terabox_url}, timeout=30)
+        response = requests.get(f"{api_url}?url={url}", timeout=40)
         data = response.json()
         
-        if data.get("ok"):
+        if data.get("ok") and data.get("list"):
             file = data["list"][0]
+            size_mb = file.get("size", 0) / (1024 * 1024)
+            
             return {
                 "success": True,
                 "direct_link": file.get("dlink"),
-                "filename": file.get("server_filename"),
-                "size": f"{file.get('size',0)/(1024*1024):.2f} MB"
+                "filename": file.get("server_filename", "Unknown"),
+                "size": f"{size_mb:.2f} MB",
+                "thumb": file.get("thumbs", {}).get("url3")
             }
-    except:
-        pass
+    except Exception as e:
+        print(e)
+    
     return {"success": False}
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     
-    real_link, code = convert_to_real_link(url)
+    # Supported domains
+    domains = ["terabox", "1024terabox", "terasharefile", "4funbox", "nephobox", "teraboxapp"]
     
-    if not real_link:
-        await update.message.reply_text("❌ Invalid or unsupported link!")
+    if not any(d in url.lower() for d in domains):
+        await update.message.reply_text("❌ Invalid link! Only TeraBox links allowed.")
         return
-        
-    msg = await update.message.reply_text(
-        f"🔄 Converting...\n"
-        f"🔗 Detected: Wrapper link\n"
-        f"✅ Converted →\n`{real_link}`",
-        parse_mode="Markdown"
-    )
     
-    await msg.edit_text("⏳ Extracting direct download link...")
+    msg = await update.message.reply_text("🔥 Cracking link using premium API...")
     
-    result = get_direct_link(real_link)
+    result = get_direct_link(url)
     
     if result.get("success"):
-        await msg.edit_text(
-            f"✅ **SUCCESS!**\n\n"
-            f"📁 **File:** `{result['filename']}`\n"
-            f"📦 **Size:** {result['size']}\n\n"
-            f"🔗 **Direct Download Link:**\n`{result['direct_link']}`\n\n"
-            f"💡 Ab isko VidHide pe daal do!",
-            parse_mode="Markdown"
-        )
+        text = f"""
+✅ **DIRECT LINK MIL GAYA!**
+
+📁 **File:** `{result['filename']}`
+📦 **Size:** {result['size']}
+
+🔗 **Download Link:**
+`{result['direct_link']}`
+
+💡 Ab isko VidHide pe remote upload kar do!
+        """
+        await msg.edit_text(text, parse_mode="Markdown")
     else:
         await msg.edit_text(
-            f"✅ **Link Converted!**\n\n"
-            f"🔗 **Real TeraBox Link:**\n`{real_link}`\n\n"
-            f"⚠️ Direct link nahi mila, lekin ye link ab normal TeraBox hai\n"
-            f"Ab kisi bhi bot mein daal do ya manually download karo!",
-            parse_mode="Markdown"
+            "❌ **Failed to extract link**\n\n"
+            "Possible reasons:\n"
+            "• Link expired hai\n"
+            "• Password protected hai\n"
+            "• File delete ho gaya\n\n"
+            "Koi aur link try karo!"
         )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔥 **Wrapper to Real TeraBox Converter**\n\n"
-        "Send any link:\n"
+        "🔥 **TERABOX DIRECT LINK BOT 2025**\n\n"
+        "Bhejo koi bhi link:\n"
         "• terasharefile.com\n"
         "• 1024terabox.com\n"
-        "• 4funbox.co\n"
         "• terabox.com/s/xxx\n\n"
-        "I will convert it to real working link! 😈"
+        "Main direct download link dunga!\n\n"
+        "Bas link bhejo, baaki main sambhal lunga 😈"
     )
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Wrapper Killer Bot Started!")
+    
+    print("ULTIMATE TERABOX BOT STARTED - 2025 READY!")
     app.run_polling()
 
-import requests
 if __name__ == "__main__":
     main()
