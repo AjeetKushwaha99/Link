@@ -4,13 +4,7 @@ import json
 import asyncio
 import logging
 import time
-import hashlib
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -26,15 +20,11 @@ from telegram.ext import (
 
 # ============== CONFIG ==============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-DOWNLOAD_PATH = "./downloads"
-MAX_FILE_SIZE = 50 * 1024 * 1024
-
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
 
 def extract_file_id(text):
@@ -50,243 +40,515 @@ def extract_file_id(text):
 
 
 # =============================================
-#  CHROME DRIVER SETUP
+#  DISKWALA EXTRACTOR - PLAYWRIGHT
+#  Uses page's OWN Axios with AppiCrypt
 # =============================================
-def get_chrome_driver():
-    options = Options()
-    options.add_argument('--headless=new')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--disable-extensions')
-    options.add_argument('--disable-software-rasterizer')
-    options.add_argument('--window-size=1920,1080')
-    options.add_argument(
-        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/120.0.0.0 Safari/537.36'
-    )
+class DiskWalaExtractor:
 
-    # Enable network logging
-    options.set_capability(
-        'goog:loggingPrefs', {'performance': 'ALL'}
-    )
+    async def extract_video(self, file_id):
+        result = {
+            'success': False,
+            'title': 'Unknown',
+            'video_url': None,
+            'file_info': None,
+            'error': None,
+            'debug': '',
+        }
 
-    options.binary_location = '/usr/bin/google-chrome'
+        browser = None
+        try:
+            from playwright.async_api import async_playwright
 
-    driver = webdriver.Chrome(options=options)
-    return driver
+            pw = await async_playwright().start()
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                ],
+            )
 
+            context = await browser.new_context(
+                user_agent=(
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
+            )
 
-# =============================================
-#  EXTRACT VIDEO URL FROM DISKWALA
-# =============================================
-def extract_video_sync(file_id):
-    """
-    Uses real Chrome browser to:
-    1. Open DiskWala page
-    2. Let AppiCrypt WASM load & run
-    3. Capture API responses with video URL
-    """
-    result = {
-        'success': False,
-        'title': 'Unknown',
-        'video_url': None,
-        'file_info': None,
-        'error': None,
-    }
+            page = await context.new_page()
 
-    driver = None
-    try:
-        logger.info(f"Starting Chrome for file: {file_id}")
-        driver = get_chrome_driver()
+            # ===== CAPTURE ALL NETWORK TRAFFIC =====
+            captured = {
+                'sign_data': None,
+                'temp_info': None,
+                'video_urls': [],
+                'all_api': [],
+            }
 
-        # Enable CDP Network domain to capture responses
-        driver.execute_cdp_cmd('Network.enable', {})
-
-        url = f"https://www.diskwala.com/app/{file_id}"
-        logger.info(f"Opening: {url}")
-        driver.get(url)
-
-        # Wait for page to load
-        time.sleep(5)
-
-        # METHOD 1: Intercept network requests via logs
-        logger.info("Checking network logs...")
-        logs = driver.get_log('performance')
-
-        api_responses = []
-        video_urls = []
-
-        for log_entry in logs:
-            try:
-                log_data = json.loads(log_entry['message'])
-                message = log_data.get('message', {})
-                method = message.get('method', '')
-                params = message.get('params', {})
-
-                # Capture request URLs
-                if method == 'Network.requestWillBeSent':
-                    req_url = params.get(
-                        'request', {}
-                    ).get('url', '')
-
-                    if any(
-                        kw in req_url.lower()
-                        for kw in [
-                            'sign', 'temp_info', 'video',
-                            'stream', 'download', '.mp4',
-                            '.mkv', 'storage.googleapis',
-                            'r2.cloudflarestorage',
-                            'cdn', 'media',
-                        ]
-                    ):
-                        logger.info(
-                            f"Interesting request: {req_url}"
-                        )
-                        video_urls.append(req_url)
-
-                # Capture response data
-                if method == 'Network.responseReceived':
-                    resp = params.get('response', {})
-                    resp_url = resp.get('url', '')
-                    resp_type = resp.get(
-                        'mimeType', ''
-                    )
-
-                    if 'ddudapidd.diskwala.com' in resp_url:
-                        req_id = params.get('requestId')
+            async def on_response(response):
+                url = response.url
+                try:
+                    if 'ddudapidd.diskwala.com' in url:
                         try:
-                            body = driver.execute_cdp_cmd(
-                                'Network.getResponseBody',
-                                {'requestId': req_id},
-                            )
-                            body_text = body.get('body', '')
-                            logger.info(
-                                f"API Response [{resp_url}]:"
-                                f" {body_text[:500]}"
-                            )
-                            api_responses.append({
-                                'url': resp_url,
-                                'body': body_text,
+                            body = await response.text()
+                            captured['all_api'].append({
+                                'url': url,
+                                'status': response.status,
+                                'body': body,
                             })
+                            logger.info(
+                                f"API [{response.status}] "
+                                f"{url}: {body[:300]}"
+                            )
+
+                            if response.status == 200:
+                                data = json.loads(body)
+                                if '/file/sign' in url:
+                                    captured['sign_data'] = data
+                                if '/file/temp_info' in url:
+                                    captured['temp_info'] = data
+
                         except Exception:
                             pass
 
-                    if 'video' in resp_type:
-                        logger.info(
-                            f"Video response: {resp_url}"
-                        )
-                        video_urls.append(resp_url)
+                    ct = response.headers.get(
+                        'content-type', ''
+                    )
+                    if (
+                        'video' in ct
+                        or 'octet-stream' in ct
+                    ):
+                        captured['video_urls'].append(url)
+                        logger.info(f"VIDEO URL: {url}")
 
+                    if any(
+                        kw in url.lower()
+                        for kw in [
+                            '.mp4', '.mkv', '.webm',
+                            '.m3u8',
+                            'storage.googleapis',
+                            'r2.cloudflarestorage',
+                            'cdn.diskwala',
+                        ]
+                    ):
+                        captured['video_urls'].append(url)
+
+                except Exception:
+                    pass
+
+            page.on('response', on_response)
+
+            # ===== OPEN PAGE =====
+            url = f"https://www.diskwala.com/app/{file_id}"
+            logger.info(f"Opening: {url}")
+
+            await page.goto(url, timeout=30000)
+            await page.wait_for_load_state('networkidle')
+            await asyncio.sleep(3)
+
+            # ===== WAIT FOR REACT APP TO LOAD =====
+            logger.info("Waiting for React app...")
+            try:
+                await page.wait_for_selector(
+                    '#root > *', timeout=10000
+                )
             except Exception:
-                pass
+                logger.warning("React root not populated")
 
-        # METHOD 2: Execute JS to call API
-        # (browser has AppiCrypt loaded!)
-        logger.info("Calling API from browser JS...")
+            await asyncio.sleep(2)
 
-        # Call /file/temp_info from inside browser
-        try:
-            temp_info_js = f"""
-                return await (async () => {{
-                    try {{
-                        // Get the axios instance
-                        // It's already configured
-                        // with AppiCrypt interceptor
+            # ===== KEY STEP: USE PAGE'S AXIOS =====
+            # The React app has already loaded:
+            # 1. appicrypt-web WASM module
+            # 2. Axios with interceptor
+            # We need to find and use THAT axios instance
 
-                        // Try using fetch with
-                        // the page's context
-                        const response = await fetch(
-                            'https://ddudapidd.diskwala.com'
-                            + '/api/v1/file/temp_info',
-                            {{
-                                method: 'POST',
-                                headers: {{
-                                    'Content-Type':
-                                        'application/json',
-                                }},
-                                body: JSON.stringify({{
-                                    id: '{file_id}'
-                                }}),
-                                credentials: 'include',
-                            }}
-                        );
-                        const data = await response.text();
-                        return {{
-                            status: response.status,
-                            data: data,
-                        }};
-                    }} catch(e) {{
-                        return {{error: e.message}};
-                    }}
-                }})();
-            """
-            temp_result = driver.execute_script(temp_info_js)
-            logger.info(f"temp_info result: {temp_result}")
+            logger.info(
+                "Injecting script to use page's Axios..."
+            )
 
-            if temp_result and temp_result.get('data'):
-                try:
-                    info = json.loads(temp_result['data'])
-                    result['file_info'] = info
-                    logger.info(f"File info: {info}")
+            # First: inject a script that imports the
+            # same module the page uses
+            api_result = await page.evaluate("""
+                async (fileId) => {
+                    const results = {
+                        method: null,
+                        sign: null,
+                        temp_info: null,
+                        error: null,
+                    };
 
-                    # Extract title
-                    for key in ['name', 'fileName', 'title']:
-                        if key in info:
-                            result['title'] = info[key]
-                            break
+                    try {
+                        // METHOD 1: Find existing axios
+                        // in webpack modules
+                        // The page bundles everything in
+                        // webpackChunk
 
-                except Exception as e:
-                    logger.error(f"JSON parse error: {e}")
-        except Exception as e:
-            logger.error(f"temp_info JS error: {e}")
+                        let axiosInstance = null;
 
-        # Call /file/sign from inside browser
-        # (AppiCrypt will auto-generate headers!)
-        try:
-            sign_js = f"""
-                return await (async () => {{
-                    try {{
-                        const response = await fetch(
-                            'https://ddudapidd.diskwala.com'
-                            + '/api/v1/file/sign',
-                            {{
-                                method: 'POST',
-                                headers: {{
-                                    'Content-Type':
-                                        'application/json',
-                                }},
-                                body: JSON.stringify({{
-                                    id: '{file_id}'
-                                }}),
-                                credentials: 'include',
-                            }}
-                        );
-                        const data = await response.text();
-                        return {{
-                            status: response.status,
-                            data: data,
-                        }};
-                    }} catch(e) {{
-                        return {{error: e.message}};
-                    }}
-                }})();
-            """
-            sign_result = driver.execute_script(sign_js)
-            logger.info(f"sign result: {sign_result}")
+                        // Check if page already made
+                        // the API calls and data is
+                        // in React state
+                        const rootEl = document
+                            .getElementById('root');
 
-            if sign_result and sign_result.get('data'):
-                try:
-                    sign_data = json.loads(
-                        sign_result['data']
-                    )
-                    logger.info(
-                        f"Sign data: "
-                        f"{json.dumps(sign_data)[:500]}"
-                    )
+                        if (rootEl) {
+                            // Try to get React fiber
+                            const fiberKey = Object.keys(
+                                rootEl
+                            ).find(
+                                k => k.startsWith(
+                                    '__reactFiber'
+                                )
+                            );
 
-                    # Extract video URL from sign response
+                            if (fiberKey) {
+                                results.method =
+                                    'react_fiber';
+
+                                // Traverse React tree to
+                                // find file data
+                                let fiber = rootEl[fiberKey];
+                                const visited = new Set();
+                                const queue = [fiber];
+
+                                while (queue.length > 0) {
+                                    const node = queue.shift();
+                                    if (!node || visited.has(node))
+                                        continue;
+                                    visited.add(node);
+
+                                    if (visited.size > 500)
+                                        break;
+
+                                    // Check memoizedState
+                                    // and memoizedProps
+                                    const state =
+                                        node.memoizedState;
+                                    const props =
+                                        node.memoizedProps;
+
+                                    if (state) {
+                                        const stateStr =
+                                            JSON.stringify(
+                                                state
+                                            );
+                                        if (
+                                            stateStr &&
+                                            stateStr.includes(
+                                                'signedUrl'
+                                            )
+                                        ) {
+                                            results.sign =
+                                                stateStr
+                                                    .substring(
+                                                        0, 2000
+                                                    );
+                                        }
+                                        if (
+                                            stateStr &&
+                                            (stateStr.includes(
+                                                'fileName'
+                                            ) ||
+                                            stateStr.includes(
+                                                'file_name'
+                                            ) ||
+                                            stateStr.includes(
+                                                fileId
+                                            ))
+                                        ) {
+                                            results.temp_info =
+                                                stateStr
+                                                    .substring(
+                                                        0, 2000
+                                                    );
+                                        }
+                                    }
+
+                                    if (props) {
+                                        const propsStr =
+                                            JSON.stringify(
+                                                props
+                                            );
+                                        if (
+                                            propsStr &&
+                                            (propsStr.includes(
+                                                'http'
+                                            ) &&
+                                            (propsStr.includes(
+                                                '.mp4'
+                                            ) ||
+                                            propsStr.includes(
+                                                'storage'
+                                            ) ||
+                                            propsStr.includes(
+                                                'signed'
+                                            )))
+                                        ) {
+                                            results.sign =
+                                                propsStr
+                                                    .substring(
+                                                        0, 2000
+                                                    );
+                                        }
+                                    }
+
+                                    // Traverse tree
+                                    if (node.child)
+                                        queue.push(node.child);
+                                    if (node.sibling)
+                                        queue.push(
+                                            node.sibling
+                                        );
+                                    if (node.return)
+                                        queue.push(
+                                            node.return
+                                        );
+                                }
+                            }
+                        }
+
+                        // METHOD 2: Access webpack modules
+                        // to find the axios instance
+                        if (!results.sign) {
+                            results.method = 'webpack';
+
+                            const chunkName = Object.keys(
+                                window
+                            ).find(
+                                k => k.includes(
+                                    'webpackChunk'
+                                )
+                            );
+
+                            if (
+                                chunkName &&
+                                window[chunkName]
+                            ) {
+                                // Inject into webpack
+                                // to get module 960
+                                // (appicrypt) and the
+                                // axios instance
+                                let resolveAxios;
+                                const axiosPromise =
+                                    new Promise(r => {
+                                        resolveAxios = r;
+                                    });
+
+                                window[chunkName].push([
+                                    ['custom-chunk'],
+                                    {},
+                                    (require) => {
+                                        try {
+                                            // Module 960
+                                            // = appicrypt
+                                            const appicrypt =
+                                                require(960);
+                                            resolveAxios({
+                                                appicrypt,
+                                                require,
+                                            });
+                                        } catch(e) {
+                                            resolveAxios({
+                                                error:
+                                                    e.message,
+                                            });
+                                        }
+                                    },
+                                ]);
+
+                                const modules =
+                                    await Promise.race([
+                                        axiosPromise,
+                                        new Promise(r =>
+                                            setTimeout(
+                                                () => r(null),
+                                                5000,
+                                            )
+                                        ),
+                                    ]);
+
+                                if (
+                                    modules &&
+                                    modules.appicrypt
+                                ) {
+                                    // Use the appicrypt
+                                    // module to generate
+                                    // headers
+                                    const genHeaders =
+                                        modules
+                                            .appicrypt.d;
+
+                                    if (genHeaders) {
+                                        // Generate headers
+                                        // for /file/sign
+                                        const headers =
+                                            await genHeaders({
+                                                method: 'POST',
+                                                urlPath:
+                                                    '/file/sign',
+                                                data: {
+                                                    id: fileId,
+                                                },
+                                            });
+
+                                        results.method =
+                                            'appicrypt_direct';
+
+                                        // Now make the
+                                        // actual API call
+                                        const resp =
+                                            await fetch(
+                                                'https://'
+                                                + 'ddudapidd'
+                                                + '.diskwala'
+                                                + '.com/api'
+                                                + '/v1/file'
+                                                + '/sign',
+                                                {
+                                                    method:
+                                                        'POST',
+                                                    headers:
+                                                        headers,
+                                                    body:
+                                                        JSON
+                                                        .stringify(
+                                                            {
+                                                                id:
+                                                                    fileId,
+                                                            }
+                                                        ),
+                                                    credentials:
+                                                        'include',
+                                                },
+                                            );
+
+                                        const data =
+                                            await resp
+                                                .text();
+                                        results.sign =
+                                            data;
+
+                                        // Also get
+                                        // temp_info
+                                        const headers2 =
+                                            await genHeaders({
+                                                method:
+                                                    'POST',
+                                                urlPath:
+                                                    '/file'
+                                                    + '/temp'
+                                                    + '_info',
+                                                data: {
+                                                    id:
+                                                        fileId,
+                                                },
+                                            });
+
+                                        const resp2 =
+                                            await fetch(
+                                                'https://'
+                                                + 'ddudapidd'
+                                                + '.diskwala'
+                                                + '.com/api'
+                                                + '/v1/file'
+                                                + '/temp_info',
+                                                {
+                                                    method:
+                                                        'POST',
+                                                    headers:
+                                                        headers2,
+                                                    body:
+                                                        JSON
+                                                        .stringify(
+                                                            {
+                                                                id:
+                                                                    fileId,
+                                                            }
+                                                        ),
+                                                    credentials:
+                                                        'include',
+                                                },
+                                            );
+
+                                        results.temp_info =
+                                            await resp2
+                                                .text();
+                                    }
+                                }
+                            }
+                        }
+
+                        // METHOD 3: Check video elements
+                        const videos = document
+                            .querySelectorAll('video');
+                        const videoSrcs = [];
+                        videos.forEach(v => {
+                            if (v.src) videoSrcs.push(v.src);
+                            if (v.currentSrc)
+                                videoSrcs.push(v.currentSrc);
+                            v.querySelectorAll('source')
+                             .forEach(s => {
+                                if (s.src)
+                                    videoSrcs.push(s.src);
+                            });
+                        });
+                        if (videoSrcs.length > 0) {
+                            results.video_elements =
+                                videoSrcs;
+                        }
+
+                        results.title = document.title;
+
+                    } catch(e) {
+                        results.error = e.message
+                            + ' | ' + e.stack;
+                    }
+
+                    return results;
+                }
+            """, file_id)
+
+            logger.info(
+                f"Page evaluate result: "
+                f"{json.dumps(api_result)[:1000]}"
+            )
+
+            # ===== PROCESS RESULTS =====
+            def find_url_in_data(data):
+                """Recursively find video URL"""
+                if isinstance(data, str):
+                    if data.startswith('http'):
+                        return data
+                    try:
+                        return find_url_in_data(
+                            json.loads(data)
+                        )
+                    except Exception:
+                        # Search for URLs in string
+                        urls = re.findall(
+                            r'https?://[^\s"\'<>]+',
+                            data,
+                        )
+                        for u in urls:
+                            if any(
+                                kw in u.lower()
+                                for kw in [
+                                    '.mp4', '.mkv',
+                                    '.webm', 'storage',
+                                    'signed', 'download',
+                                    'stream', 'video',
+                                    'cdn', 'media',
+                                    'r2.cloudflare',
+                                ]
+                            ):
+                                return u
+                    return None
+
+                if isinstance(data, dict):
                     url_keys = [
                         'url', 'signedUrl', 'signed_url',
                         'downloadUrl', 'download_url',
@@ -294,260 +556,175 @@ def extract_video_sync(file_id):
                         'link', 'fileUrl', 'file_url',
                         'streamUrl', 'stream_url',
                         'src', 'source', 'path',
-                        'location',
+                        'location', 'href',
                     ]
+                    for key in url_keys:
+                        if key in data:
+                            val = data[key]
+                            if isinstance(
+                                val, str
+                            ) and val.startswith('http'):
+                                return val
+                    for val in data.values():
+                        found = find_url_in_data(val)
+                        if found:
+                            return found
 
-                    def find_url(data, depth=0):
-                        if depth > 3:
-                            return None
-                        if isinstance(data, str):
-                            if data.startswith('http'):
-                                return data
-                            return None
-                        if isinstance(data, dict):
-                            for key in url_keys:
-                                if key in data:
-                                    val = data[key]
-                                    if isinstance(
-                                        val, str
-                                    ) and val.startswith(
-                                        'http'
-                                    ):
-                                        return val
-                            for key, val in data.items():
-                                found = find_url(
-                                    val, depth + 1
-                                )
-                                if found:
-                                    return found
-                        if isinstance(data, list):
-                            for item in data:
-                                found = find_url(
-                                    item, depth + 1
-                                )
-                                if found:
-                                    return found
-                        return None
+                if isinstance(data, list):
+                    for item in data:
+                        found = find_url_in_data(item)
+                        if found:
+                            return found
 
-                    video_url = find_url(sign_data)
+                return None
+
+            # Check api_result from page.evaluate
+            if api_result:
+                result['debug'] = json.dumps(
+                    api_result
+                )[:1500]
+
+                if api_result.get('sign'):
+                    video_url = find_url_in_data(
+                        api_result['sign']
+                    )
                     if video_url:
                         result['success'] = True
                         result['video_url'] = video_url
-                        logger.info(
-                            f"VIDEO URL FOUND: {video_url}"
-                        )
 
-                except Exception as e:
-                    logger.error(
-                        f"Sign JSON parse error: {e}"
+                if (
+                    not result['success']
+                    and api_result.get('temp_info')
+                ):
+                    video_url = find_url_in_data(
+                        api_result['temp_info']
                     )
-        except Exception as e:
-            logger.error(f"sign JS error: {e}")
+                    if video_url:
+                        result['success'] = True
+                        result['video_url'] = video_url
 
-        # METHOD 3: Use the page's OWN axios instance
-        if not result['success']:
-            logger.info(
-                "Trying page's own axios instance..."
-            )
-            try:
-                axios_js = f"""
-                    return await (async () => {{
-                        try {{
-                            // Find the axios instance
-                            // on the page
-                            // The React app stores it
-
-                            // Method A: Direct window check
-                            if (window.__NEXT_DATA__) {{
-                                return {{
-                                    next: JSON.stringify(
-                                        window.__NEXT_DATA__
-                                    ),
-                                }};
-                            }}
-
-                            // Method B: Check React fiber
-                            const root = document
-                                .getElementById('root');
-                            if (root && root._reactRootContainer) {{
-                                return {{
-                                    react: 'found root',
-                                }};
-                            }}
-
-                            // Method C: Look for video
-                            // elements on page
-                            const vids = document
-                                .querySelectorAll('video');
-                            const vidData = [];
-                            vids.forEach(v => {{
-                                vidData.push({{
-                                    src: v.src,
-                                    currentSrc: v.currentSrc,
-                                    poster: v.poster,
-                                }});
-                                v.querySelectorAll('source')
-                                 .forEach(s => {{
-                                    vidData.push({{
-                                        src: s.src,
-                                        type: s.type,
-                                    }});
-                                }});
-                            }});
-
-                            // Method D: Check all iframes
-                            const iframes = document
-                                .querySelectorAll('iframe');
-                            const iframeData = [];
-                            iframes.forEach(f => {{
-                                iframeData.push({{
-                                    src: f.src,
-                                }});
-                            }});
-
-                            // Method E: Get page HTML
-                            const bodyHTML = document.body
-                                ? document.body.innerHTML
-                                    .substring(0, 5000)
-                                : '';
-
-                            return {{
-                                videos: vidData,
-                                iframes: iframeData,
-                                title: document.title,
-                                bodyPreview: bodyHTML,
-                            }};
-                        }} catch(e) {{
-                            return {{error: e.message}};
-                        }}
-                    }})();
-                """
-                page_data = driver.execute_script(axios_js)
-                logger.info(
-                    f"Page data: "
-                    f"{json.dumps(page_data)[:1000]}"
-                )
-
-                if page_data:
-                    # Check videos
-                    for v in page_data.get('videos', []):
-                        src = v.get('src') or v.get(
-                            'currentSrc', ''
-                        )
-                        if src and src.startswith('http'):
+                if (
+                    not result['success']
+                    and api_result.get('video_elements')
+                ):
+                    for src in api_result['video_elements']:
+                        if (
+                            src
+                            and src.startswith('http')
+                        ):
                             result['success'] = True
                             result['video_url'] = src
                             break
 
-                    result['title'] = page_data.get(
-                        'title', result['title']
+                result['title'] = api_result.get(
+                    'title', 'DiskWala Video'
+                )
+
+            # Check captured network responses
+            if not result['success']:
+                if captured.get('sign_data'):
+                    video_url = find_url_in_data(
+                        captured['sign_data']
                     )
-
-            except Exception as e:
-                logger.error(f"Axios JS error: {e}")
-
-        # METHOD 4: Check captured network URLs
-        if not result['success'] and video_urls:
-            for vu in video_urls:
-                if any(
-                    ext in vu.lower()
-                    for ext in [
-                        '.mp4', '.mkv', '.webm',
-                        'storage.googleapis',
-                        'r2.cloudflarestorage',
-                        'stream', 'video', 'media',
-                    ]
-                ):
-                    if 'ddudapidd' not in vu:
+                    if video_url:
                         result['success'] = True
-                        result['video_url'] = vu
-                        break
+                        result['video_url'] = video_url
 
-        # METHOD 5: Check API response bodies
-        if not result['success'] and api_responses:
-            for api_resp in api_responses:
-                try:
-                    data = json.loads(api_resp['body'])
-                    video_url = None
-                    if isinstance(data, dict):
-                        for key in [
-                            'url', 'signedUrl',
-                            'download_url', 'link',
-                            'videoUrl', 'src',
-                        ]:
-                            if key in data:
-                                val = data[key]
-                                if isinstance(
-                                    val, str
-                                ) and val.startswith(
-                                    'http'
-                                ):
-                                    video_url = val
-                                    break
+                if (
+                    not result['success']
+                    and captured.get('temp_info')
+                ):
+                    video_url = find_url_in_data(
+                        captured['temp_info']
+                    )
+                    if video_url:
+                        result['success'] = True
+                        result['video_url'] = video_url
+
+                if (
+                    not result['success']
+                    and captured['video_urls']
+                ):
+                    for vu in captured['video_urls']:
+                        if 'ddudapidd' not in vu:
+                            result['success'] = True
+                            result['video_url'] = vu
+                            break
+
+            # Check all API responses
+            if (
+                not result['success']
+                and captured['all_api']
+            ):
+                for api in captured['all_api']:
+                    video_url = find_url_in_data(
+                        api.get('body', '')
+                    )
                     if video_url:
                         result['success'] = True
                         result['video_url'] = video_url
                         break
-                except Exception:
-                    pass
 
-        if not result['success']:
-            result['error'] = (
-                "Video URL nahi mila.\n"
-                f"API responses: {len(api_responses)}\n"
-                f"Network URLs: {len(video_urls)}\n"
-            )
-            if api_responses:
-                result['error'] += (
-                    f"\nAPI Data:\n"
-                    f"{api_responses[0].get('body', '')[:500]}"
+            if not result['success']:
+                result['error'] = (
+                    f"Method: "
+                    f"{api_result.get('method', '?')}\n"
+                    f"JS Error: "
+                    f"{api_result.get('error', 'None')}\n"
+                    f"Network APIs: "
+                    f"{len(captured['all_api'])}\n"
+                    f"Video URLs: "
+                    f"{len(captured['video_urls'])}\n"
                 )
-            if result.get('file_info'):
-                result['error'] += (
-                    f"\nFile Info:\n"
-                    f"{json.dumps(result['file_info'])[:500]}"
-                )
+                if captured['all_api']:
+                    for api in captured['all_api'][:3]:
+                        result['error'] += (
+                            f"\nAPI [{api['status']}] "
+                            f"{api['url']}:\n"
+                            f"{api['body'][:200]}\n"
+                        )
 
-    except Exception as e:
-        logger.error(f"Chrome error: {e}")
-        result['error'] = f"Browser error: {str(e)}"
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        except Exception as e:
+            logger.error(f"Extract error: {e}")
+            result['error'] = str(e)
+        finally:
+            if browser:
+                await browser.close()
+                await pw.stop()
 
-    return result
+        return result
 
 
-# =============================================
-#  TELEGRAM BOT HANDLERS
-# =============================================
+extractor = DiskWalaExtractor()
+
+
+# ============== BOT HANDLERS ==============
 async def start(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
     await update.message.reply_text(
-        "🎬 **DiskWala Video Downloader Bot**\n\n"
-        "DiskWala ka link bhejo!\n"
-        "Main direct download link dunga! 🚀\n\n"
-        "**Example:**\n"
+        "🎬 *DiskWala Video Downloader Bot*\n\n"
+        "DiskWala ka link bhejo\\!\n"
+        "Main direct download link dunga\\! 🚀\n\n"
+        "*Example:*\n"
         "`https://www.diskwala.com/app/xxxxx`\n\n"
-        "⏱ Pehli baar 20-30 sec lagenge",
-        parse_mode='Markdown',
+        "⏱ 20\\-30 seconds lagenge",
+        parse_mode='MarkdownV2',
     )
 
 
 async def process_link(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
     text = update.message.text.strip()
     file_id = extract_file_id(text)
 
     if not file_id:
         await update.message.reply_text(
-            "❌ Valid DiskWala link nahi hai!\n\n"
-            "Example:\n"
+            "❌ Valid DiskWala link nahi!\n"
+            "Example: "
             "`https://www.diskwala.com/app/xxxxx`",
             parse_mode='Markdown',
         )
@@ -555,30 +732,18 @@ async def process_link(
 
     msg = await update.message.reply_text(
         "⏳ **Processing...**\n"
-        "🌐 Chrome browser start ho raha hai...\n"
-        "🔐 AppiCrypt bypass ho raha hai...\n"
-        "⏱ 20-30 seconds wait karo...",
+        "🌐 Browser open ho raha hai...\n"
+        "🔐 Security bypass ho raha hai...\n"
+        "⏱ 20-30 sec wait karo...",
         parse_mode='Markdown',
     )
 
     try:
-        # Run sync Chrome in executor
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, extract_video_sync, file_id
-        )
+        result = await extractor.extract_video(file_id)
 
         if result['success'] and result['video_url']:
             video_url = result['video_url']
-
-            response_text = (
-                f"✅ **Video Mil Gaya!**\n\n"
-                f"📹 **Title:** {result['title']}\n\n"
-                f"🔗 **Direct Download Link:**\n"
-                f"`{video_url}`\n\n"
-                f"👆 Link copy karke browser mein kholo\n"
-                f"Ya niche button dabao!"
-            )
+            title = result.get('title', 'DiskWala Video')
 
             keyboard = []
             if video_url.startswith('http'):
@@ -590,32 +755,49 @@ async def process_link(
                 ])
 
             await msg.edit_text(
-                response_text,
+                f"✅ **Video Mil Gaya!**\n\n"
+                f"📹 **Title:** {title}\n\n"
+                f"🔗 **Direct Link:**\n"
+                f"`{video_url}`\n\n"
+                f"👆 Copy karke browser mein kholo!",
                 parse_mode='Markdown',
                 reply_markup=(
                     InlineKeyboardMarkup(keyboard)
-                    if keyboard else None
+                    if keyboard
+                    else None
                 ),
             )
-
         else:
             error = result.get('error', 'Unknown')
+            debug = result.get('debug', '')
+
+            error_msg = f"❌ **Video nahi mila**\n\n"
+            error_msg += f"🔍 Details:\n{error}\n"
+
+            if debug:
+                short_debug = debug[:500]
+                error_msg += (
+                    f"\n📦 Debug:\n`{short_debug}`"
+                )
+
+            error_msg += (
+                f"\n\n💡 File ID: `{file_id}`"
+                f"\n\nYe info developer ko bhejo!"
+            )
+
             await msg.edit_text(
-                f"❌ **Video nahi mila**\n\n"
-                f"🔍 Debug Info:\n"
-                f"```\n{error[:1000]}\n```\n\n"
-                f"💡 File ID: `{file_id}`\n\n"
-                f"Ye info developer ko bhejo!",
+                error_msg,
                 parse_mode='Markdown',
             )
 
     except Exception as e:
-        logger.error(f"Process error: {e}")
+        logger.error(f"Error: {e}")
         await msg.edit_text(f"❌ Error: {str(e)}")
 
 
 async def handle_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
     if not update.message or not update.message.text:
         return
@@ -632,12 +814,10 @@ async def handle_message(
 
 def main():
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN not set!")
+        print("❌ BOT_TOKEN set karo!")
         return
-
-    print("🤖 Starting DiskWala Bot...")
+    print("🤖 Starting bot...")
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(
@@ -646,7 +826,6 @@ def main():
             handle_message,
         )
     )
-
     print("✅ Bot running!")
     app.run_polling(drop_pending_updates=True)
 
